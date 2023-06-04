@@ -1,10 +1,6 @@
-use anyhow::Context;
 use rustengan::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    format,
-    io::{StdoutLock, Write},
-};
+use std::{format, io::StdoutLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -24,22 +20,10 @@ struct UniqNode {
 
 impl Node<(), Payload> for UniqNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        match input.body.payload {
+        match &input.body.payload {
             Payload::Generate {} => {
                 let guid = format!("{}-{}", self.node, self.id);
-                let reply = Message {
-                    src: input.dest,
-                    dest: input.src,
-                    body: Body {
-                        id: Some(self.id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::GenerateOk { guid },
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("Serialize response to Generate")?;
-                output.write_all(b"\n").context("write tailing new line")?;
-                self.id += 1;
+                input.reply(Payload::GenerateOk { guid }, Some(&mut self.id), output)?;
             }
             Payload::GenerateOk { .. } => {}
         }
@@ -50,11 +34,11 @@ impl Node<(), Payload> for UniqNode {
     where
         Self: Sized,
     {
-        let state = UniqNode {
+        let node = UniqNode {
             id: 1,
             node: init.node_id,
         };
-        Ok(state)
+        Ok(node)
     }
 }
 

@@ -1,7 +1,6 @@
-use anyhow::Context;
 use rustengan::*;
 use serde::{Deserialize, Serialize};
-use std::io::{StdoutLock, Write};
+use std::io::StdoutLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -17,21 +16,13 @@ struct EchoNode {
 
 impl Node<(), Payload> for EchoNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        match input.body.payload {
+        match &input.body.payload {
             Payload::Echo { echo } => {
-                let reply = Message {
-                    src: input.dest,
-                    dest: input.src,
-                    body: Body {
-                        id: Some(self.id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::EchoOk { echo },
-                    },
-                };
-                serde_json::to_writer(&mut *output, &reply)
-                    .context("Serialize response to Echo")?;
-                output.write_all(b"\n").context("write tailing new line")?;
-                self.id += 1;
+                input.reply(
+                    Payload::EchoOk { echo: echo.clone() },
+                    Some(&mut self.id),
+                    output,
+                )?;
             }
             Payload::EchoOk { .. } => {}
         }

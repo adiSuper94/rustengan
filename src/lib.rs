@@ -10,6 +10,38 @@ pub struct Message<Payload> {
     pub body: Body<Payload>,
 }
 
+impl<Payload> Message<Payload>
+where
+    Payload: Serialize,
+{
+    pub fn reply(
+        &self,
+        payload: Payload,
+        id: Option<&mut usize>,
+        output: &mut StdoutLock,
+    ) -> anyhow::Result<()> {
+        let reply = Self {
+            src: self.dest.clone(),
+            dest: self.src.clone(),
+            body: Body {
+                id: match id {
+                    Some(val) => {
+                        let old = *val;
+                        *val += 1;
+                        Some(old)
+                    }
+                    None => None,
+                },
+                in_reply_to: self.body.id,
+                payload,
+            },
+        };
+        serde_json::to_writer(&mut *output, &reply).context("Serialize response")?;
+        output.write_all(b"\n").context("write tailing new line")?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Body<Payload> {
     #[serde(rename = "msg_id")]
