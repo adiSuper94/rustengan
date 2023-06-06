@@ -14,13 +14,8 @@ impl<Payload> Message<Payload>
 where
     Payload: Serialize,
 {
-    pub fn reply(
-        &self,
-        payload: Payload,
-        id: Option<&mut usize>,
-        output: &mut StdoutLock,
-    ) -> anyhow::Result<()> {
-        let reply = Self {
+    pub fn construct_reply(&self, payload: Payload, id: Option<&mut usize>) -> Self {
+        Self {
             src: self.dest.clone(),
             dest: self.src.clone(),
             body: Body {
@@ -35,10 +30,7 @@ where
                 in_reply_to: self.body.id,
                 payload,
             },
-        };
-        serde_json::to_writer(&mut *output, &reply).context("Serialize response")?;
-        output.write_all(b"\n").context("write tailing new line")?;
-        Ok(())
+        }
     }
 }
 
@@ -65,16 +57,25 @@ pub struct Init {
     pub node_ids: Vec<String>,
 }
 
-pub trait Node<S, Payload> {
-    fn from_init(state: S, init: Init) -> anyhow::Result<Self>
+pub trait Node<Payload> {
+    fn from_init(init: Init) -> anyhow::Result<Self>
     where
         Self: Sized;
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
+
+    fn send(&self, message: &Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>
+    where
+        Payload: Serialize,
+    {
+        serde_json::to_writer(&mut *output, message).context("Serialize response")?;
+        output.write_all(b"\n").context("write tailing new line")?;
+        Ok(())
+    }
 }
 
-pub fn main_loop<S, N, P>(init_state: S) -> anyhow::Result<()>
+pub fn main_loop<N, P>() -> anyhow::Result<()>
 where
-    N: Node<S, P>,
+    N: Node<P>,
     P: DeserializeOwned,
 {
     // WTF is DeserializedOwned??
@@ -100,7 +101,7 @@ where
     serde_json::to_writer(&mut stdout, &reply).context("serialize response to init")?;
     stdout.write_all(b"\n").context("write trailing newline")?;
     let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<P>>();
-    let mut node: N = Node::from_init(init_state, init)?;
+    let mut node: N = Node::from_init(init)?;
     for input in inputs {
         let input = input.context("could not deser input from STDIN")?;
         node.step(input, &mut stdout)?;

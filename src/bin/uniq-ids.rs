@@ -18,19 +18,20 @@ struct UniqNode {
     node: String,
 }
 
-impl Node<(), Payload> for UniqNode {
+impl Node<Payload> for UniqNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
         match &input.body.payload {
             Payload::Generate {} => {
                 let guid = format!("{}-{}", self.node, self.id);
-                input.reply(Payload::GenerateOk { guid }, Some(&mut self.id), output)?;
+                let reply = input.construct_reply(Payload::GenerateOk { guid }, Some(&mut self.id));
+                self.send(&reply, output)?;
             }
             Payload::GenerateOk { .. } => {}
         }
         Ok(())
     }
 
-    fn from_init(_state: (), init: Init) -> anyhow::Result<Self>
+    fn from_init(init: Init) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -43,5 +44,5 @@ impl Node<(), Payload> for UniqNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, UniqNode, _>(())
+    main_loop::<UniqNode, _>()
 }

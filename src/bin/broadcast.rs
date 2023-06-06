@@ -1,6 +1,10 @@
 use rustengan::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::StdoutLock};
+use std::{
+    collections::{HashMap, HashSet},
+    io::StdoutLock,
+    panic,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -21,46 +25,64 @@ enum Payload {
 }
 
 struct BroadcastNode {
+    node: String,
     id: usize,
-    messages: Vec<usize>,
+    messages: HashSet<usize>,
+    known: HashMap<String, HashSet<usize>>,
+    neighbours: Vec<String>,
+    msg_communicated: HashMap<usize, HashSet<usize>>,
 }
 
-impl Node<(), Payload> for BroadcastNode {
+impl Node<Payload> for BroadcastNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
         match &input.body.payload {
             Payload::Read => {
-                input.reply(
+                let reply = input.construct_reply(
                     Payload::ReadOk {
-                        messages: self.messages.clone(),
+                        messages: self.messages.clone().into_iter().collect(),
                     },
                     Some(&mut self.id),
-                    output,
-                )?;
+                );
+                self.send(&reply, output)?;
             }
             Payload::Broadcast { message } => {
-                self.messages.push(message.clone());
-                input.reply(Payload::BroadcastOk, Some(&mut self.id), output)?;
+                self.messages.insert(Clone::clone(message));
+                let reply = input.construct_reply(Payload::BroadcastOk, Some(&mut self.id));
+                self.send(&reply, output)?;
             }
-            Payload::Topology { topology: _ } => {
-                input.reply(Payload::TopologyOk, Some(&mut self.id), output)?;
+            Payload::Topology { topology } => {
+                self.neighbours = topology
+                    .clone()
+                    .remove(&self.node)
+                    .unwrap_or_else(|| panic!("no topology give for node {}", &self.node));
+                let reply = input.construct_reply(Payload::TopologyOk, Some(&mut self.id));
+                self.send(&reply, output)?;
             }
             Payload::ReadOk { .. } | Payload::BroadcastOk | Payload::TopologyOk => {}
         }
         Ok(())
     }
 
-    fn from_init(_state: (), _init: Init) -> anyhow::Result<Self>
+    fn from_init(init: Init) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
         let node = BroadcastNode {
+            node: init.node_id,
             id: 1,
-            messages: Vec::new(),
+            messages: HashSet::new(),
+            known: init
+                .node_ids
+                .into_iter()
+                .map(|nid| (nid, HashSet::new()))
+                .collect(),
+            msg_communicated: HashMap::new(),
+            neighbours: Vec::new(),
         };
         Ok(node)
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, BroadcastNode, _>(())
+    main_loop::<BroadcastNode, _>()
 }

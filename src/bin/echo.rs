@@ -14,22 +14,20 @@ struct EchoNode {
     id: usize,
 }
 
-impl Node<(), Payload> for EchoNode {
+impl Node<Payload> for EchoNode {
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
         match &input.body.payload {
             Payload::Echo { echo } => {
-                input.reply(
-                    Payload::EchoOk { echo: echo.clone() },
-                    Some(&mut self.id),
-                    output,
-                )?;
+                let reply = input
+                    .construct_reply(Payload::EchoOk { echo: echo.clone() }, Some(&mut self.id));
+                self.send(&reply, output)?;
             }
             Payload::EchoOk { .. } => {}
         }
         Ok(())
     }
 
-    fn from_init(_state: (), _init: Init) -> anyhow::Result<Self>
+    fn from_init(_init: Init) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -38,5 +36,5 @@ impl Node<(), Payload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, _>(())
+    main_loop::<EchoNode, _>()
 }
