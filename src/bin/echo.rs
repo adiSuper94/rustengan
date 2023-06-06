@@ -15,7 +15,8 @@ struct EchoNode {
 }
 
 impl Node<Payload> for EchoNode {
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, event: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = event else{panic!("");};
         match &input.body.payload {
             Payload::Echo { echo } => {
                 let reply = input
@@ -27,7 +28,7 @@ impl Node<Payload> for EchoNode {
         Ok(())
     }
 
-    fn from_init(_init: Init) -> anyhow::Result<Self>
+    fn from_init(_init: Init, _tx: std::sync::mpsc::Sender<Event<Payload>>) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -36,5 +37,5 @@ impl Node<Payload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<EchoNode, _>()
+    main_loop::<EchoNode, _, _>()
 }

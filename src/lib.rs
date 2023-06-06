@@ -10,6 +10,13 @@ pub struct Message<Payload> {
     pub body: Body<Payload>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Event<Payload, InjectedPayload = ()> {
+    Message(Message<Payload>),
+    InjectedPayload(InjectedPayload),
+    EOF,
+}
+
 impl<Payload> Message<Payload>
 where
     Payload: Serialize,
@@ -57,15 +64,15 @@ pub struct Init {
     pub node_ids: Vec<String>,
 }
 
-pub trait Node<Payload> {
-    fn from_init(init: Init) -> anyhow::Result<Self>
+pub trait Node<P, IP = ()> {
+    fn from_init(init: Init, tx: std::sync::mpsc::Sender<Event<P, IP>>) -> anyhow::Result<Self>
     where
         Self: Sized;
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>;
+    fn step(&mut self, input: Event<P, IP>, output: &mut StdoutLock) -> anyhow::Result<()>;
 
-    fn send(&self, message: &Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()>
+    fn send(&self, message: &Message<P>, output: &mut StdoutLock) -> anyhow::Result<()>
     where
-        Payload: Serialize,
+        P: Serialize,
     {
         serde_json::to_writer(&mut *output, message).context("Serialize response")?;
         output.write_all(b"\n").context("write tailing new line")?;
@@ -73,10 +80,11 @@ pub trait Node<Payload> {
     }
 }
 
-pub fn main_loop<N, P>() -> anyhow::Result<()>
+pub fn main_loop<N, P, IP>() -> anyhow::Result<()>
 where
-    N: Node<P>,
-    P: DeserializeOwned,
+    N: Node<P, IP>,
+    P: DeserializeOwned + Send + 'static,
+    IP: Send + 'static,
 {
     // WTF is DeserializedOwned??
     let mut stdin = std::io::stdin().lock();
@@ -100,11 +108,25 @@ where
     };
     serde_json::to_writer(&mut stdout, &reply).context("serialize response to init")?;
     stdout.write_all(b"\n").context("write trailing newline")?;
-    let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<P>>();
-    let mut node: N = Node::from_init(init)?;
-    for input in inputs {
-        let input = input.context("could not deser input from STDIN")?;
-        node.step(input, &mut stdout)?;
+    let (tx, rx) = std::sync::mpsc::channel::<Event<P, IP>>();
+    let mut node: N = Node::from_init(init, tx.clone()).context("node initialization failed")?;
+    drop(stdin);
+    let th = std::thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message<P>>();
+        for input in inputs {
+            let input = input.context("could not deser input from STDIN")?;
+            let _ = tx.send(Event::Message(input));
+        }
+        let _ = tx.send(Event::EOF);
+        Ok::<_, anyhow::Error>(())
+    });
+    for input in rx {
+        node.step(input, &mut stdout)
+            .context("Node step fucntion failed")?;
     }
+    th.join()
+        .expect("Thread join failed")
+        .context("stdin process failed")?;
     Ok(())
 }
