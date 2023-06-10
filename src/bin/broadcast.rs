@@ -26,7 +26,9 @@ enum Payload {
     Gossip {
         new_messages: Vec<usize>,
     },
-    GossipOk,
+    GossipOk {
+        new_messages: Vec<usize>,
+    },
 }
 
 enum InjectedPayload {
@@ -75,10 +77,25 @@ impl Node<Payload, InjectedPayload> for BroadcastNode {
                 Payload::ReadOk { .. } | Payload::BroadcastOk | Payload::TopologyOk => {}
                 Payload::Gossip { new_messages } => {
                     self.messages.extend(new_messages);
-                    let reply = input.construct_reply(Payload::GossipOk, Some(&mut self.id));
+                    self.known
+                        .entry(input.src.clone())
+                        .or_default()
+                        .extend(new_messages);
+                    let known_by_src = self
+                        .known
+                        .get(&input.src)
+                        .expect("known map could not find required set");
+                    let response_messages =
+                        self.messages.difference(known_by_src).cloned().collect();
+                    let reply = input.construct_reply(
+                        Payload::GossipOk {
+                            new_messages: response_messages,
+                        },
+                        Some(&mut self.id),
+                    );
                     self.send(&reply, output)?;
                 }
-                Payload::GossipOk => {
+                Payload::GossipOk { new_messages } => {
                     if let Some(in_reply_to) = &input.body.in_reply_to {
                         if self.msg_communicated.contains_key(in_reply_to) {
                             let communicated_messages =
@@ -88,6 +105,11 @@ impl Node<Payload, InjectedPayload> for BroadcastNode {
                                 .entry(input.src.clone())
                                 .or_default()
                                 .extend(communicated_messages);
+                            self.known
+                                .entry(input.src.clone())
+                                .or_default()
+                                .extend(new_messages);
+                            self.messages.extend(new_messages);
                         }
                     }
                 }
@@ -98,6 +120,9 @@ impl Node<Payload, InjectedPayload> for BroadcastNode {
                         let neighbour_known = self.known.entry(neighbour.clone()).or_default();
                         let new_messages: Vec<usize> =
                             self.messages.difference(neighbour_known).cloned().collect();
+                        if new_messages.is_empty() {
+                            continue;
+                        }
                         let message = Message {
                             dest: neighbour.clone(),
                             src: self.node.clone(),
@@ -133,7 +158,7 @@ impl Node<Payload, InjectedPayload> for BroadcastNode {
         std::thread::spawn(move || {
             // TODO: Handle EOF
             loop {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(200));
                 if tx
                     .send(Event::InjectedPayload(InjectedPayload::Gossip))
                     .is_err()
