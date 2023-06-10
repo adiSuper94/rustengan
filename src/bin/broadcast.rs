@@ -120,7 +120,7 @@ impl Node<Payload, InjectedPayload> for BroadcastNode {
                         let neighbour_known = self.known.entry(neighbour.clone()).or_default();
                         let new_messages: Vec<usize> =
                             self.messages.difference(neighbour_known).cloned().collect();
-                        if new_messages.is_empty() {
+                        if new_messages.is_empty() || self.node.as_str() == neighbour {
                             continue;
                         }
                         let message = Message {
