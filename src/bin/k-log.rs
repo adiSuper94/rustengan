@@ -1,6 +1,10 @@
 use rustengan::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::StdoutLock, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::StdoutLock,
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -39,14 +43,14 @@ struct KLogNode {
     node: String,
     nodes: Vec<String>,
     id: usize,
-    logs: HashMap<String, HashMap<usize, usize>>,
+    logs: HashMap<String, BTreeMap<usize, usize>>,
     next_offset: usize,
     processed_till: HashMap<String, usize>,
 }
 
 impl KLogNode {
     pub fn append_log(&mut self, key: String, msg: usize) -> usize {
-        let log = self.logs.entry(key).or_insert(HashMap::new());
+        let log = self.logs.entry(key).or_insert(BTreeMap::new());
         log.insert(self.next_offset, msg);
         self.next_offset += 1;
         self.next_offset - 1
