@@ -1,3 +1,4 @@
+use regex::Regex;
 use rustengan::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,12 +34,6 @@ enum Payload {
     ListCommittedOffsetsOk {
         offsets: HashMap<String, usize>,
     },
-    Read {
-        key: String,
-    },
-    ReadOk {
-        value: usize,
-    },
     Cas {
         key: String,
         from: usize,
@@ -63,7 +58,18 @@ struct KLogNode {
     id: usize,
     logs: HashMap<String, BTreeMap<usize, usize>>,
     processed_till: HashMap<String, usize>,
-    logs_to_process: HashMap<String, (Option<usize>, String, usize, Option<usize>)>,
+    curr_offset: usize,
+    logs_to_process: HashMap<usize, LogToProcess>,
+}
+
+struct LogToProcess {
+    key: String,
+    msg: usize,
+    request_src: String,
+    offset: Option<usize>,
+    request_msg_id: Option<usize>,
+    cas_msg_id: usize,
+    cas_failed: bool,
 }
 
 impl Node<Payload, InjectedPayload> for KLogNode {
@@ -75,14 +81,27 @@ impl Node<Payload, InjectedPayload> for KLogNode {
         match &event {
             Event::Message(input) => match &input.body.payload {
                 Payload::Send { key, msg } => {
-                    let payload = Payload::Read { key: key.clone() };
+                    let log_details = LogToProcess {
+                        key: key.clone(),
+                        msg: msg.clone(),
+                        request_src: input.src.clone(),
+                        offset: Some(self.curr_offset + 1),
+                        request_msg_id: input.body.id,
+                        cas_msg_id: self.id,
+                        cas_failed: false,
+                    };
+                    self.logs_to_process.insert(self.id, log_details);
+                    let payload = Payload::Cas {
+                        key: "offset".to_string(),
+                        from: self.curr_offset,
+                        to: self.curr_offset + 1,
+                        put: true,
+                    };
                     let mut reply = input.construct_reply(payload, Some(&mut self.id));
-                    self.logs_to_process.insert(
-                        input.src.clone(),
-                        (None, key.clone(), msg.clone(), input.body.id),
-                    );
                     reply.body.in_reply_to = None;
+                    reply.dest = "lin-kv".to_string();
                     self.send(&reply, output)?;
+                    self.curr_offset += 1;
                 }
                 Payload::Poll { offsets } => {
                     let mut msgs: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -124,42 +143,27 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                     );
                     self.send(&reply, output)?;
                 }
-                Payload::ReadOk { value } => {
-                    if let Some(entry) = self.logs_to_process.iter_mut().next() {
-                        let val = entry.1;
-                        let payload = Payload::Cas {
-                            key: "offset".to_string(),
-                            from: *value,
-                            to: *value + 1,
-                            put: true,
-                        };
-                        val.0 = Some(*value + 1);
-                        let mut message = input.construct_reply(payload, Some(&mut self.id));
-                        message.body.in_reply_to = None;
-                        self.send(&message, output)?;
-                    }
-                }
                 Payload::CasOk => {
-                    if let Some(entry) = self.logs_to_process.iter().next() {
-                        let send_msg_scr = entry.0.clone();
-                        let log_details = entry.1.clone();
-                        let key = log_details.1;
-                        let val = log_details.2;
-                        let log = self.logs.entry(key.clone()).or_insert(BTreeMap::new());
-                        if let Some(offset) = log_details.0 {
-                            log.insert(offset, val);
+                    let cas_msg_id = &input.body.in_reply_to.unwrap_or(0);
+                    if let Some(log_details) = self.logs_to_process.get(cas_msg_id) {
+                        let key = log_details.key.clone();
+                        let send_msg_scr = log_details.request_src.clone();
+                        let msg = log_details.msg;
+                        let log = self.logs.entry(key).or_insert(BTreeMap::new());
+                        if let Some(offset) = log_details.offset {
+                            log.insert(offset, msg);
                             let payload = Payload::SendOk { offset };
                             let mut send_ok_response =
                                 input.construct_reply(payload, Some(&mut self.id));
-                            send_ok_response.body.in_reply_to = log_details.3;
-                            self.logs_to_process.remove(&send_msg_scr);
+                            send_ok_response.body.in_reply_to = log_details.request_msg_id;
                             send_ok_response.dest = send_msg_scr;
                             self.send(&send_ok_response, output)?;
+                            self.logs_to_process.remove(&cas_msg_id);
                         }
                     }
                 }
-                Payload::Error { code, text: _text } => {
-                    if code == &20 {
+                Payload::Error { code, text } => match code {
+                    20 => {
                         let payload = Payload::Cas {
                             key: "offset".to_string(),
                             from: 0,
@@ -170,20 +174,40 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                         message.body.in_reply_to = None;
                         self.send(&message, output)?;
                     }
-                }
+                    22 => {
+                        let regex =
+                            Regex::new(r"current value (?<new>\d+) is not (?<old>\d+)").unwrap();
+                        if let Some(caps) = regex.captures(text) {
+                            let new_val = usize::from_str_radix(&caps["new"], 10).unwrap();
+                            self.curr_offset = new_val;
+                            if let Some(log_details) = self
+                                .logs_to_process
+                                .get_mut(&input.body.in_reply_to.unwrap_or(usize::MAX))
+                            {
+                                log_details.cas_failed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 Payload::SendOk { .. }
                 | Payload::PollOk { .. }
                 | Payload::CommitOffsetsOk
                 | Payload::ListCommittedOffsetsOk { .. }
-                | Payload::Read { .. }
                 | Payload::Cas { .. } => {}
             },
             Event::InjectedPayload(injected_payload) => match &injected_payload {
                 InjectedPayload::Gossip => {
-                    let payload = Payload::Read {
-                        key: "offset".to_string(),
-                    };
-                    if let Some(_dest) = self.logs_to_process.keys().next() {
+                    for (_key, log_details) in self.logs_to_process.iter_mut() {
+                        if !log_details.cas_failed {
+                            continue;
+                        }
+                        let payload = Payload::Cas {
+                            key: "offset".to_string(),
+                            from: self.curr_offset,
+                            to: self.curr_offset + 1,
+                            put: true,
+                        };
                         let message = Message {
                             src: self.node.to_string(),
                             dest: "lin-kv".to_string(),
@@ -193,8 +217,11 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                                 in_reply_to: None,
                             },
                         };
+                        log_details.cas_msg_id = self.id;
+                        log_details.cas_failed = false;
                         self.id += 1;
                         self.send(&message, output)?;
+                        break;
                     }
                 }
             },
@@ -213,7 +240,7 @@ impl Node<Payload, InjectedPayload> for KLogNode {
         std::thread::spawn(move || {
             // TODO: Handle EOF
             loop {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(Duration::from_millis(10));
                 if tx
                     .send(Event::InjectedPayload(InjectedPayload::Gossip))
                     .is_err()
@@ -233,6 +260,7 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                 .collect(),
             node: init.node_id,
             logs_to_process: HashMap::new(),
+            curr_offset: 0,
         };
         Ok(node)
     }
