@@ -2,6 +2,7 @@ use regex::Regex;
 use rustengan::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::max,
     collections::{BTreeMap, HashMap},
     io::StdoutLock,
     time::Duration,
@@ -46,9 +47,13 @@ enum Payload {
         code: isize,
         text: String,
     },
+    Gossip {
+        offset: usize,
+    },
 }
 
 enum InjectedPayload {
+    CasRetry,
     Gossip,
 }
 
@@ -60,6 +65,7 @@ struct KLogNode {
     processed_till: HashMap<String, usize>,
     curr_offset: usize,
     logs_to_process: HashMap<usize, LogToProcess>,
+    known_offsets: HashMap<String, usize>,
 }
 
 struct LogToProcess {
@@ -190,6 +196,12 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                     }
                     _ => {}
                 },
+                Payload::Gossip { offset } => {
+                    self.curr_offset = max(self.curr_offset, offset.clone());
+                    // self.known_offsets.insert(input.src.clone(), offset.clone());
+                    let known_offset = self.known_offsets.entry(input.src.clone()).or_insert(0);
+                    *known_offset = *offset;
+                }
                 Payload::SendOk { .. }
                 | Payload::PollOk { .. }
                 | Payload::CommitOffsetsOk
@@ -197,7 +209,7 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                 | Payload::Cas { .. } => {}
             },
             Event::InjectedPayload(injected_payload) => match &injected_payload {
-                InjectedPayload::Gossip => {
+                InjectedPayload::CasRetry => {
                     for (_key, log_details) in self.logs_to_process.iter_mut() {
                         if !log_details.cas_failed {
                             continue;
@@ -217,11 +229,36 @@ impl Node<Payload, InjectedPayload> for KLogNode {
                                 in_reply_to: None,
                             },
                         };
+                        self.curr_offset += 1;
                         log_details.cas_msg_id = self.id;
                         log_details.cas_failed = false;
                         self.id += 1;
                         self.send(&message, output)?;
                         break;
+                    }
+                }
+                InjectedPayload::Gossip => {
+                    for node in self.nodes.iter() {
+                        if let Some(known_offset) = self.known_offsets.get(node) {
+                            if *known_offset >= self.curr_offset {
+                                self.curr_offset = *known_offset;
+                                continue;
+                            }
+                        }
+                        let payload = Payload::Gossip {
+                            offset: self.curr_offset,
+                        };
+                        let message = Message {
+                            src: self.node.to_string(),
+                            dest: node.to_string(),
+                            body: Body {
+                                payload,
+                                id: Some(self.id),
+                                in_reply_to: None,
+                            },
+                        };
+                        self.id += 1;
+                        self.send(&message, output)?;
                     }
                 }
             },
@@ -240,7 +277,13 @@ impl Node<Payload, InjectedPayload> for KLogNode {
         std::thread::spawn(move || {
             // TODO: Handle EOF
             loop {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(50));
+                if tx
+                    .send(Event::InjectedPayload(InjectedPayload::CasRetry))
+                    .is_err()
+                {
+                    break;
+                }
                 if tx
                     .send(Event::InjectedPayload(InjectedPayload::Gossip))
                     .is_err()
@@ -261,6 +304,7 @@ impl Node<Payload, InjectedPayload> for KLogNode {
             node: init.node_id,
             logs_to_process: HashMap::new(),
             curr_offset: 0,
+            known_offsets: HashMap::new(),
         };
         Ok(node)
     }
