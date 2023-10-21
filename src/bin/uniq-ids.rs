@@ -20,7 +20,9 @@ struct UniqNode {
 
 impl Node<Payload> for UniqNode {
     fn step(&mut self, event: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        let Event::Message(input) = event else{panic!("");};
+        let Event::Message(input) = event else {
+            panic!("");
+        };
         match &input.body.payload {
             Payload::Generate {} => {
                 let guid = format!("{}-{}", self.node, self.id);

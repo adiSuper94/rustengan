@@ -95,7 +95,7 @@ where
         .expect("no init message received")
         .context("could not serialize init message")?;
     let InitPayload::Init(init) = init_msg.body.payload else {
-    panic!("First message was not Init");
+        panic!("First message was not Init");
     };
     let reply = Message {
         src: init_msg.dest,
