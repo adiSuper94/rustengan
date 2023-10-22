@@ -6,37 +6,58 @@ use std::{collections::HashMap, io::StdoutLock, str::FromStr};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum Payload {
-    Txn {
-        txn: Vec<(String, isize, Option<isize>)>,
-    },
-    TxnOk {
-        txn: Vec<(String, isize, Option<isize>)>,
-    },
+    Txn { txn: Vec<Op> },
+    TxnOk { txn: Vec<Op> },
 }
 
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// enum OpType {
-//     Read("r"),
-//     Write("w"),
-// }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OpType {
+    Read,
+    Write,
+}
 
-// impl FromStr for OpType {
-//     type Err = anyhow::Error;
-//     fn from_str(s: &str) -> Result<Self, Self::Err> {
-//         match s {
-//             "r" => Ok(OpType::Read),
-//             "w" => Ok(OpType::Write),
-//             _ => Err(anyhow::anyhow!("Invalid op type")),
-//         }
-//     }
-// }
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// struct Op {
-//     op_type: OpType,
-//     key: String,
-//     val: Option<isize>,
-// }
+#[derive(Debug, Clone)]
+struct Op {
+    op_type: OpType,
+    key: isize,
+    val: Option<isize>,
+}
 
+impl FromStr for OpType {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "r" => Ok(OpType::Read),
+            "w" => Ok(OpType::Write),
+            _ => Err(anyhow::anyhow!("Invalid op type")),
+        }
+    }
+}
+impl Serialize for Op {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let op = match &self.op_type {
+            OpType::Read => "r".to_string(),
+            OpType::Write => "w".to_string(),
+        };
+        (op, &self.key, &self.val).serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Op {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Deserialize::deserialize(deserializer).map(
+            |(ot, key, val): (String, isize, Option<isize>)| {
+                let op_type = OpType::from_str(ot.as_ref()).unwrap();
+                Op { op_type, key, val }
+            },
+        )
+    }
+}
 struct TAMap {
     id: usize,
     node: String,
@@ -50,15 +71,22 @@ impl Node<Payload> for TAMap {
         };
         match &input.body.payload {
             Payload::Txn { txn } => {
-                let mut response_txn: Vec<(String, isize, Option<isize>)> = Vec::new();
+                let mut response_txn: Vec<Op> = Vec::new();
                 for op in txn {
-                    if op.0 == "r" {
-                        let val = self.map.get(&op.1.to_string()).cloned();
-                        response_txn.push((op.0.to_string(), op.1.clone(), val));
-                    } else if op.0 == "w" {
-                        if let Some(val) = op.2 {
-                            self.map.insert(op.1.to_string(), val);
-                            response_txn.push((op.0.to_string(), op.1.clone(), Some(val)));
+                    match op.op_type {
+                        OpType::Read => {
+                            let val = self.map.get(&op.key.to_string()).cloned();
+                            response_txn.push(Op {
+                                op_type: op.op_type.clone(),
+                                key: op.key.clone(),
+                                val,
+                            });
+                        }
+                        OpType::Write => {
+                            if let Some(val) = op.val {
+                                self.map.insert(op.key.to_string(), val);
+                                response_txn.push(op.clone());
+                            }
                         }
                     }
                 }
