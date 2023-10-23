@@ -1,6 +1,6 @@
 use rustengan::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::StdoutLock, str::FromStr};
+use std::{collections::HashMap, io::StdoutLock, str::FromStr, time::Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -8,6 +8,12 @@ use std::{collections::HashMap, io::StdoutLock, str::FromStr};
 enum Payload {
     Txn { txn: Vec<Op> },
     TxnOk { txn: Vec<Op> },
+    Gossip { txn: Txn },
+    GossipOk,
+}
+
+enum InjectedPayload {
+    Gossip,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +27,11 @@ struct Op {
     op_type: OpType,
     key: isize,
     val: Option<isize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Txn {
+    ops: Vec<Op>,
 }
 
 impl FromStr for OpType {
@@ -61,53 +72,133 @@ impl<'de> Deserialize<'de> for Op {
 struct TAMap {
     id: usize,
     node: String,
+    nodes: Vec<String>,
     map: HashMap<String, isize>,
+    txns_to_gossip: HashMap<String, Vec<Txn>>,
+    gossiped_txn: HashMap<usize, (String, Vec<Txn>)>,
 }
 
-impl Node<Payload> for TAMap {
-    fn step(&mut self, event: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        let Event::Message(input) = event else {
-            panic!("");
-        };
-        match &input.body.payload {
-            Payload::Txn { txn } => {
-                let mut response_txn: Vec<Op> = Vec::new();
-                for op in txn {
-                    match op.op_type {
-                        OpType::Read => {
-                            let val = self.map.get(&op.key.to_string()).cloned();
-                            response_txn.push(Op {
-                                op_type: op.op_type.clone(),
-                                key: op.key.clone(),
-                                val,
-                            });
-                        }
-                        OpType::Write => {
-                            if let Some(val) = op.val {
-                                self.map.insert(op.key.to_string(), val);
-                                response_txn.push(op.clone());
+impl Node<Payload, InjectedPayload> for TAMap {
+    fn step(
+        &mut self,
+        event: rustengan::Event<Payload, InjectedPayload>,
+        output: &mut StdoutLock,
+    ) -> anyhow::Result<()> {
+        match &event {
+            Event::Message(input) => match &input.body.payload {
+                Payload::Txn { txn } => {
+                    let mut response_txn: Vec<Op> = Vec::new();
+                    for op in txn {
+                        match op.op_type {
+                            OpType::Read => {
+                                let val = self.map.get(&op.key.to_string()).cloned();
+                                response_txn.push(Op {
+                                    op_type: op.op_type.clone(),
+                                    key: op.key.clone(),
+                                    val,
+                                });
+                            }
+                            OpType::Write => {
+                                if let Some(val) = op.val {
+                                    self.map.insert(op.key.to_string(), val);
+                                    response_txn.push(op.clone());
+                                }
                             }
                         }
                     }
-                }
+                    for node in &self.nodes {
+                        if &self.node != node {
+                            self.txns_to_gossip
+                                .entry(node.clone())
+                                .or_insert_with(Vec::new)
+                                .push(Txn { ops: txn.clone() });
+                        }
+                    }
 
-                let reply =
-                    input.construct_reply(Payload::TxnOk { txn: response_txn }, Some(&mut self.id));
-                self.send(&reply, output)?;
-            }
-            Payload::TxnOk { txn: _txn } => {}
+                    let reply = input
+                        .construct_reply(Payload::TxnOk { txn: response_txn }, Some(&mut self.id));
+                    self.send(&reply, output)?;
+                }
+                Payload::TxnOk { txn: _txn } => {}
+                Payload::Gossip { txn } => {
+                    for op in &txn.ops {
+                        match op.op_type {
+                            OpType::Read => {}
+                            OpType::Write => {
+                                if let Some(val) = op.val {
+                                    self.map.insert(op.key.to_string(), val);
+                                }
+                            }
+                        }
+                    }
+                    let reply = input.construct_reply(Payload::GossipOk, Some(&mut self.id));
+                    self.send(&reply, output)?;
+                }
+                Payload::GossipOk => {
+                    let ref_msg_id = input.body.in_reply_to.unwrap();
+                    self.gossiped_txn.remove(&ref_msg_id);
+                }
+            },
+            Event::InjectedPayload(injected_input) => match injected_input {
+                InjectedPayload::Gossip => {
+                    if let Some(node) = self.txns_to_gossip.keys().next().cloned() {
+                        let txns = self.txns_to_gossip.get(&node).unwrap().clone();
+                        for t in &txns {
+                            let payload = Payload::Gossip { txn: t.clone() };
+                            let msg = Message {
+                                src: self.node.clone(),
+                                dest: node.clone(),
+                                body: Body {
+                                    payload,
+                                    id: Some(self.id),
+                                    in_reply_to: None,
+                                },
+                            };
+                            self.send(&msg, output)?;
+                            self.gossiped_txn
+                                .insert(self.id, (node.clone(), txns.clone()));
+                            self.id += 1;
+                        }
+                        self.txns_to_gossip.remove(&node);
+                    }
+                }
+            },
+            Event::EOF => todo!(),
         }
+
         Ok(())
     }
 
-    fn from_init(init: Init, _tx: std::sync::mpsc::Sender<Event<Payload>>) -> anyhow::Result<Self>
+    fn from_init(
+        init: Init,
+        tx: std::sync::mpsc::Sender<rustengan::Event<Payload, InjectedPayload>>,
+    ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
+        std::thread::spawn(move || {
+            // TODO: Handle EOF
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                if tx
+                    .send(Event::InjectedPayload(InjectedPayload::Gossip))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let node = TAMap {
             id: 1,
+            nodes: init
+                .node_ids
+                .into_iter()
+                .filter(|n| n != &init.node_id)
+                .collect(),
             node: init.node_id,
             map: HashMap::new(),
+            txns_to_gossip: HashMap::new(),
+            gossiped_txn: HashMap::new(),
         };
         Ok(node)
     }
